@@ -61,6 +61,7 @@ const (
 	TypeSystemPropertyNameResolvedBaseTypes
 	TypeSystemPropertyNameWriteType
 	TypeSystemPropertyNameInitializerIsUndefined
+	TypeSystemPropertyNameAliasTarget
 )
 
 type TypeResolution struct {
@@ -618,7 +619,6 @@ type Checker struct {
 	argumentsSymbol                             *ast.Symbol
 	requireSymbol                               *ast.Symbol
 	unknownSymbol                               *ast.Symbol
-	resolvingSymbol                             *ast.Symbol
 	unresolvedSymbols                           map[string]*ast.Symbol
 	errorTypes                                  map[string]*Type
 	globalThisSymbol                            *ast.Symbol
@@ -915,7 +915,6 @@ func NewChecker(program Program) *Checker {
 	c.argumentsSymbol = c.newSymbol(ast.SymbolFlagsProperty, "arguments")
 	c.requireSymbol = c.newSymbol(ast.SymbolFlagsProperty, "require")
 	c.unknownSymbol = c.newSymbol(ast.SymbolFlagsProperty, "unknown")
-	c.resolvingSymbol = c.newSymbol(ast.SymbolFlagsNone, ast.InternalSymbolNameResolving)
 	c.unresolvedSymbols = make(map[string]*ast.Symbol)
 	c.errorTypes = make(map[string]*Type)
 	c.globalThisSymbol = c.newSymbolEx(ast.SymbolFlagsModule, "globalThis", ast.CheckFlagsReadonly)
@@ -1905,46 +1904,64 @@ func (c *Checker) isBlockScopedNameDeclaredBeforeUse(declaration *ast.Node, usag
 }
 
 func (c *Checker) isUsedInFunctionOrInstanceProperty(usage *ast.Node, declaration *ast.Node, declContainer *ast.Node) bool {
-	for current := usage; current != nil && current != declContainer; current = current.Parent {
+	return ast.FindAncestorOrQuit(usage, func(current *ast.Node) ast.FindAncestorResult {
+		if current == declContainer {
+			return ast.FindAncestorQuit
+		}
 		if ast.IsFunctionLike(current) {
-			return ast.GetImmediatelyInvokedFunctionExpression(current) == nil
+			return ast.ToFindAncestorResult(ast.GetImmediatelyInvokedFunctionExpression(current) == nil)
 		}
 		if ast.IsClassStaticBlockDeclaration(current) {
-			return declaration.Pos() < usage.Pos()
+			return ast.ToFindAncestorResult(declaration.Pos() < usage.Pos())
 		}
-		if current.Parent != nil && ast.IsPropertyDeclaration(current.Parent) && current.Parent.Initializer() == current {
-			if ast.IsStatic(current.Parent) {
-				if ast.IsMethodDeclaration(declaration) {
-					return true
-				}
-				if ast.IsPropertyDeclaration(declaration) && ast.GetContainingClass(usage) == ast.GetContainingClass(declaration) {
-					propName := declaration.Name()
-					if ast.IsIdentifier(propName) || ast.IsPrivateIdentifier(propName) {
-						t := c.getTypeOfSymbol(c.getSymbolOfDeclaration(declaration))
-						staticBlocks := core.Filter(declaration.Parent.Members(), ast.IsClassStaticBlockDeclaration)
-						if c.isPropertyInitializedInStaticBlocks(propName, t, staticBlocks, declaration.Parent.Pos(), current.Pos()) {
-							return true
+
+		if current.Parent != nil && ast.IsPropertyDeclaration(current.Parent) {
+			propertyDeclaration := current.Parent
+			initializerOfProperty := propertyDeclaration.Initializer() == current
+			if initializerOfProperty {
+				if ast.IsStatic(current.Parent) {
+					if ast.IsMethodDeclaration(declaration) {
+						return ast.FindAncestorTrue
+					}
+					if ast.IsPropertyDeclaration(declaration) && ast.GetContainingClass(usage) == ast.GetContainingClass(declaration) {
+						propName := declaration.Name()
+						if ast.IsIdentifier(propName) || ast.IsPrivateIdentifier(propName) {
+							t := c.getTypeOfSymbol(c.getSymbolOfDeclaration(declaration))
+							staticBlocks := core.Filter(declaration.Parent.Members(), ast.IsClassStaticBlockDeclaration)
+							if c.isPropertyInitializedInStaticBlocks(propName, t, staticBlocks, declaration.Parent.Pos(), current.Pos()) {
+								return ast.FindAncestorTrue
+							}
 						}
 					}
-				}
-			} else {
-				isDeclarationInstanceProperty := ast.IsPropertyDeclaration(declaration) && !ast.IsStatic(declaration)
-				if !isDeclarationInstanceProperty || ast.GetContainingClass(usage) != ast.GetContainingClass(declaration) {
-					return true
+				} else {
+					isDeclarationInstanceProperty := ast.IsPropertyDeclaration(declaration) && !ast.IsStatic(declaration)
+					if !isDeclarationInstanceProperty || ast.GetContainingClass(usage) != ast.GetContainingClass(declaration) {
+						return ast.FindAncestorTrue
+					}
 				}
 			}
 		}
-		if current.Parent != nil && ast.IsDecorator(current.Parent) && current.Parent.AsDecorator().Expression == current {
+
+		if current.Parent != nil && ast.IsDecorator(current.Parent) {
 			decorator := current.Parent.AsDecorator()
-			if ast.IsParameter(decorator.Parent) {
-				return c.isUsedInFunctionOrInstanceProperty(decorator.Parent.Parent.Parent, declaration, declContainer)
-			}
-			if ast.IsMethodDeclaration(decorator.Parent) {
-				return c.isUsedInFunctionOrInstanceProperty(decorator.Parent.Parent, declaration, declContainer)
+			if decorator.Expression == current {
+				if ast.IsParameter(decorator.Parent) {
+					if c.isUsedInFunctionOrInstanceProperty(decorator.Parent.Parent.Parent, declaration, declContainer) {
+						return ast.FindAncestorTrue
+					}
+					return ast.FindAncestorQuit
+				}
+				if ast.IsMethodDeclaration(decorator.Parent) {
+					if c.isUsedInFunctionOrInstanceProperty(decorator.Parent.Parent, declaration, declContainer) {
+						return ast.FindAncestorTrue
+					}
+					return ast.FindAncestorQuit
+				}
 			}
 		}
-	}
-	return false
+
+		return ast.FindAncestorFalse
+	}) != nil
 }
 
 func isImmediatelyUsedInInitializerOfBlockScopedVariable(declaration *ast.Node, usage *ast.Node, declContainer *ast.Node) bool {
@@ -4234,7 +4251,7 @@ func (c *Checker) checkBaseTypeAccessibility(t *Type, node *ast.Node) {
 	signatures := c.getSignaturesOfType(t, SignatureKindConstruct)
 	if len(signatures) != 0 {
 		declaration := signatures[0].declaration
-		if declaration != nil && HasModifier(declaration, ast.ModifierFlagsPrivate) {
+		if declaration != nil && ast.HasModifier(declaration, ast.ModifierFlagsPrivate) {
 			typeClassDeclaration := ast.GetClassLikeDeclarationOfSymbol(t.symbol)
 			if !c.isNodeWithinClass(node, typeClassDeclaration) {
 				c.error(node, diagnostics.Cannot_extend_a_class_0_Class_constructor_is_marked_as_private, c.getFullyQualifiedName(t.symbol, nil))
@@ -6489,7 +6506,7 @@ func (c *Checker) checkAliasSymbol(node *ast.Node) {
 					name := node.PropertyNameOrName().Text()
 					c.addTypeOnlyDeclarationRelatedInfo(c.error(node, message, name), core.IfElse(isType, nil, typeOnlyAlias), name)
 				}
-				if isType && node.Kind == ast.KindImportEqualsDeclaration && HasModifier(node, ast.ModifierFlagsExport) {
+				if isType && node.Kind == ast.KindImportEqualsDeclaration && ast.HasModifier(node, ast.ModifierFlagsExport) {
 					c.error(node, diagnostics.Cannot_use_export_import_on_a_type_or_type_only_namespace_when_0_is_enabled, c.getIsolatedModulesLikeFlagName())
 				}
 			case ast.KindExportSpecifier:
@@ -6777,7 +6794,7 @@ func (c *Checker) checkUnusedClassMembers(node *ast.Node) {
 				break // Already would have reported an error on the getter.
 			}
 			symbol := c.getSymbolOfDeclaration(member)
-			if !c.isReferenced(symbol) && (HasModifier(member, ast.ModifierFlagsPrivate) || member.Name() != nil && ast.IsPrivateIdentifier(member.Name())) && member.Flags&ast.NodeFlagsAmbient == 0 {
+			if !c.isReferenced(symbol) && (ast.HasModifier(member, ast.ModifierFlagsPrivate) || member.Name() != nil && ast.IsPrivateIdentifier(member.Name())) && member.Flags&ast.NodeFlagsAmbient == 0 {
 				c.reportUnused(member, UnusedKindLocal, NewDiagnosticForNode(member.Name(), diagnostics.X_0_is_declared_but_its_value_is_never_read, c.symbolToString(symbol)))
 			}
 		case ast.KindConstructor:
@@ -7029,7 +7046,9 @@ func (c *Checker) getQuickTypeOfExpression(node *ast.Node) *Type {
 		if isCallChain(expr) {
 			return c.getReturnTypeOfSingleNonGenericSignatureOfCallChain(expr)
 		}
-		return c.getReturnTypeOfSingleNonGenericCallSignature(c.checkNonNullExpression(expr.Expression()))
+		return c.getReturnTypeOfSingleNonGenericSignature(c.checkNonNullExpression(expr.Expression()), SignatureKindCall)
+	case ast.IsNewExpression(expr):
+		return c.getReturnTypeOfSingleNonGenericSignature(c.checkNonNullExpression(expr.Expression()), SignatureKindConstruct)
 	case ast.IsAssertionExpression(expr) && !ast.IsConstTypeReference(expr.Type()):
 		return c.getTypeFromTypeNode(expr.Type())
 	case ast.IsLiteralExpression(node) || ast.IsBooleanLiteral(node):
@@ -7038,8 +7057,8 @@ func (c *Checker) getQuickTypeOfExpression(node *ast.Node) *Type {
 	return nil
 }
 
-func (c *Checker) getReturnTypeOfSingleNonGenericCallSignature(funcType *Type) *Type {
-	signature := c.getSingleCallSignature(funcType)
+func (c *Checker) getReturnTypeOfSingleNonGenericSignature(funcType *Type, kind SignatureKind) *Type {
+	signature := c.getSingleSignature(funcType, kind, true /*allowMembers*/)
 	if signature != nil && len(signature.typeParameters) == 0 {
 		return c.getReturnTypeOfSignature(signature)
 	}
@@ -7049,7 +7068,7 @@ func (c *Checker) getReturnTypeOfSingleNonGenericCallSignature(funcType *Type) *
 func (c *Checker) getReturnTypeOfSingleNonGenericSignatureOfCallChain(expr *ast.Node) *Type {
 	funcType := c.checkExpression(expr.Expression())
 	nonOptionalType := c.getOptionalExpressionType(funcType, expr.Expression())
-	returnType := c.getReturnTypeOfSingleNonGenericCallSignature(funcType)
+	returnType := c.getReturnTypeOfSingleNonGenericSignature(funcType, SignatureKindCall)
 	if returnType != nil {
 		return c.propagateOptionalTypeMarker(returnType, expr, nonOptionalType != funcType)
 	}
@@ -8335,7 +8354,7 @@ func (c *Checker) resolveNewExpression(node *ast.Node, candidatesOutArray *[]*Si
 		}
 		if expressionType.symbol != nil {
 			valueDecl := ast.GetClassLikeDeclarationOfSymbol(expressionType.symbol)
-			if valueDecl != nil && HasModifier(valueDecl, ast.ModifierFlagsAbstract) {
+			if valueDecl != nil && ast.HasModifier(valueDecl, ast.ModifierFlagsAbstract) {
 				c.error(node, diagnostics.Cannot_create_an_instance_of_an_abstract_class)
 				return c.resolveErrorCall(node)
 			}
@@ -9736,7 +9755,7 @@ func (c *Checker) invocationErrorRecovery(apparentType *Type, kind SignatureKind
 	// Create a diagnostic on the originating import if possible onto which we can attach a quickfix
 	//  An import call expression cannot be rewritten into another form to correct the error - the only solution is to use `.default` at the use-site
 	if importNode != nil && !ast.IsImportCall(importNode) {
-		sigs := c.getSignaturesOfType(c.getTypeOfSymbol(c.valueSymbolLinks.Get(apparentType.symbol).target), kind)
+		sigs := c.getSignaturesOfType(c.getTypeOfSymbol(c.exportTypeLinks.Get(apparentType.symbol).target), kind)
 		if len(sigs) == 0 {
 			return
 		}
@@ -11062,6 +11081,9 @@ func (c *Checker) checkPrivateIdentifierPropertyAccess(leftType *Type, right *as
 }
 
 func (c *Checker) reportNonexistentProperty(propNode *ast.Node, containingType *Type) {
+	if ast.IsJSDocNameReferenceContext(propNode) {
+		return
+	}
 	var diagnostic *ast.Diagnostic
 	if !ast.IsPrivateIdentifier(propNode) && containingType.flags&TypeFlagsUnion != 0 && containingType.flags&TypeFlagsPrimitive == 0 {
 		for _, subtype := range containingType.Types() {
@@ -15632,29 +15654,25 @@ func (c *Checker) resolveAlias(symbol *ast.Symbol) *ast.Symbol {
 	}
 	links := c.aliasSymbolLinks.Get(symbol)
 	if links.aliasTarget == nil {
-		links.aliasTarget = c.resolvingSymbol
+		if !c.pushTypeResolution(symbol, TypeSystemPropertyNameAliasTarget) {
+			return c.unknownSymbol
+		}
 		node := c.getDeclarationOfAliasSymbol(symbol)
 		if node == nil {
 			panic("Unexpected nil in resolveAlias for symbol: " + c.symbolToString(symbol))
 		}
-		target := c.getTargetOfAliasDeclaration(node, false /*dontRecursivelyResolve*/)
-		if links.aliasTarget == c.resolvingSymbol {
-			if target == nil {
-				target = c.unknownSymbol
-			}
-			links.aliasTarget = target
-		} else {
+		links.aliasTarget = core.OrElse(c.getTargetOfAliasDeclaration(node, false /*dontRecursivelyResolve*/), c.unknownSymbol)
+		if !c.popTypeResolution() {
 			c.error(node, diagnostics.Circular_definition_of_import_alias_0, c.symbolToString(symbol))
+			links.aliasTarget = c.unknownSymbol
 		}
-	} else if links.aliasTarget == c.resolvingSymbol {
-		links.aliasTarget = c.unknownSymbol
 	}
 	return links.aliasTarget
 }
 
 func (c *Checker) tryResolveAlias(symbol *ast.Symbol) *ast.Symbol {
 	links := c.aliasSymbolLinks.Get(symbol)
-	if links.aliasTarget != c.resolvingSymbol {
+	if links.aliasTarget != nil || c.findResolutionCycleStartIndex(symbol, TypeSystemPropertyNameAliasTarget) < 0 {
 		return c.resolveAlias(symbol)
 	}
 	return nil
@@ -18077,6 +18095,8 @@ func (c *Checker) typeResolutionHasProperty(r *TypeResolution) bool {
 		return c.nodeLinks.Get(r.target.(*ast.Node)).flags&NodeCheckFlagsInitializerIsUndefinedComputed != 0
 	case TypeSystemPropertyNameWriteType:
 		return c.valueSymbolLinks.Get(r.target.(*ast.Symbol)).writeType != nil
+	case TypeSystemPropertyNameAliasTarget:
+		return c.aliasSymbolLinks.Get(r.target.(*ast.Symbol)).aliasTarget != nil
 	}
 	panic("Unhandled case in typeResolutionHasProperty")
 }
@@ -18910,7 +18930,7 @@ func (c *Checker) getIndexInfosOfIndexSymbol(indexSymbol *ast.Symbol, siblingSym
 					}
 					forEachType(c.getTypeFromTypeNode(typeNode), func(keyType *Type) {
 						if c.isValidIndexKeyType(keyType) && findIndexInfo(indexInfos, keyType) == nil {
-							indexInfo := c.newIndexInfo(keyType, valueType, HasModifier(declaration, ast.ModifierFlagsReadonly), declaration, nil)
+							indexInfo := c.newIndexInfo(keyType, valueType, ast.HasModifier(declaration, ast.ModifierFlagsReadonly), declaration, nil)
 							indexInfos = append(indexInfos, indexInfo)
 						}
 					})
@@ -26821,7 +26841,7 @@ func (c *Checker) markPropertyAsReferenced(prop *ast.Symbol, nodeForCheckWriteOn
 	if prop.Flags&ast.SymbolFlagsClassMember == 0 || prop.ValueDeclaration == nil {
 		return
 	}
-	hasPrivateModifier := HasModifier(prop.ValueDeclaration, ast.ModifierFlagsPrivate)
+	hasPrivateModifier := ast.HasModifier(prop.ValueDeclaration, ast.ModifierFlagsPrivate)
 	hasPrivateIdentifier := prop.ValueDeclaration.Name() != nil && ast.IsPrivateIdentifier(prop.ValueDeclaration.Name())
 	if !hasPrivateModifier && !hasPrivateIdentifier {
 		return
